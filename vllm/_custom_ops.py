@@ -23,6 +23,7 @@ if not current_platform.is_tpu() and not current_platform.is_hpu()\
 supports_moe_ops = False
 with contextlib.suppress(ImportError):
     import vllm._moe_C  # noqa: F401
+
     supports_moe_ops = True
 
 if TYPE_CHECKING:
@@ -404,7 +405,6 @@ def gptq_gemm(a: torch.Tensor, b_q_weight: torch.Tensor,
 
 
 if hasattr(torch.ops._C, "gptq_gemm"):
-
     @register_fake("_C::gptq_gemm")
     def _gptq_gemm_fake(a: torch.Tensor, b_q_weight: torch.Tensor,
                         b_gptq_qzeros: torch.Tensor,
@@ -1561,6 +1561,27 @@ def moe_wna16_marlin_gemm(input: torch.Tensor, output: Optional[torch.Tensor],
         topk_weights, moe_block_size, top_k, mul_topk_weights, is_ep,
         b_q_type.id, size_m, size_n, size_k, is_k_full, use_atomic_add,
         use_fp32_reduce, is_zp_float)
+
+
+def moe_wna16_marlin_int2_gemm(input: torch.Tensor, output: Optional[torch.Tensor],
+                               b_qweight: torch.Tensor,
+                               b_qzeros: Optional[torch.Tensor],
+                               code_scales: torch.Tensor,
+                               code_zeros: torch.Tensor,
+                               super_scales: torch.Tensor,
+                               workspace: torch.Tensor,
+                               sorted_token_ids: torch.Tensor,
+                               expert_ids: torch.Tensor,
+                               num_tokens_past_padded: torch.Tensor,
+                               topk_weights: torch.Tensor, moe_block_size: int,
+                               top_k: int, mul_topk_weights: bool, is_ep: bool,
+                               b_q_type: ScalarType, size_m: int, size_n: int,
+                               size_k: int, use_atomic_add: bool) -> torch.Tensor:
+    return torch.ops._moe_C.moe_wna16_marlin_int2_gemm(
+        input, output, b_qweight, b_qzeros, code_scales, code_zeros, super_scales,
+        workspace, sorted_token_ids, expert_ids, num_tokens_past_padded,
+        topk_weights, moe_block_size, top_k, mul_topk_weights, is_ep,
+        b_q_type.id, size_m, size_n, size_k, use_atomic_add)
 
 
 if supports_moe_ops and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):

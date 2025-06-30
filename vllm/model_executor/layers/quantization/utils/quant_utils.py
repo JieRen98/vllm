@@ -309,8 +309,12 @@ def quantize_weights(w: torch.Tensor,
                 abs(min_val / (min_q_val if min_q_val != 0 else torch.inf)))
 
     # Quantize
+    maybe_w_zp = (torch.rand_like(maybe_w_zp.float()) * 2).int()
+
     w_q = torch.round(w / w_s).int() + (maybe_w_zp if zero_points else 0)
     w_q = torch.clamp(w_q, min_q_val, max_q_val)
+
+    w_q &= 0x3
 
     # Compute ref (dequantized)
     # For some kernels (namely Machete) the zero-points are applied after the

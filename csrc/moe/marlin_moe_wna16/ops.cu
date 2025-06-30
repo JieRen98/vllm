@@ -933,8 +933,385 @@ torch::Tensor moe_wna16_marlin_gemm(
   return c;
 }
 
+namespace MARLIN_NAMESPACE_NAME {
+  #define _GET_INT2_IF(W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS,               \
+                       THREAD_K_BLOCKS, M_BLOCK_SIZE_8, GROUP_BLOCKS,          \
+                       NUM_THREADS, IS_ZP_FLOAT)                               \
+    else if (q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS &&         \
+             thread_n_blocks == THREAD_N_BLOCKS &&                             \
+             thread_k_blocks == THREAD_K_BLOCKS &&                             \
+             m_block_size_8 == M_BLOCK_SIZE_8 &&                               \
+             group_blocks == GROUP_BLOCKS && num_threads == NUM_THREADS &&     \
+             false == IS_ZP_FLOAT) {                                           \
+      kernel = MarlinInt2<scalar_t, W_TYPE.id(), NUM_THREADS, THREAD_M_BLOCKS, \
+                          THREAD_N_BLOCKS, THREAD_K_BLOCKS, M_BLOCK_SIZE_8,    \
+                          pipe_stages, GROUP_BLOCKS, IS_ZP_FLOAT>;             \
+    }
+
+  // COMMON: cases for (group_blocks in [-1, 2, 4, 8] and is_zp_float == false)
+  //         this is the most common cases
+  // BIGGROUP: cases for big group size (group_blocks in [-1, 8])
+  // FZP: cases for float-zero-point (is_zp_float = true)
+  // ACT: cases for act order case (group_blocks == 0)
+  // FP4: cases for nvfp4(e2m1) (group_blocks == 1)
+  #define COMMON_GET_INT2_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
+    _GET_INT2_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 4, NUM_THREADS, false) \
+    _GET_INT2_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)
+
+  #define COMMON_GET_INT2_IF_M234(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)    \
+    _GET_INT2_IF(W_TYPE, 2, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false) \
+                                                                              \
+    _GET_INT2_IF(W_TYPE, 3, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false) \
+                                                                              \
+    _GET_INT2_IF(W_TYPE, 4, N_BLOCKS, K_BLOCKS, false, 4, NUM_THREADS, false)
+
+  #define COMMON_GET_INT2_IF(W_TYPE)            \
+    COMMON_GET_INT2_IF_M1(W_TYPE, 8, 8, 256)    \
+    COMMON_GET_INT2_IF_M1(W_TYPE, 8, 4, 128)    \
+    COMMON_GET_INT2_IF_M234(W_TYPE, 16, 4, 256) \
+    COMMON_GET_INT2_IF_M234(W_TYPE, 8, 4, 128)
+
+__global__ void MarlinInt2Default(MARLIN_INT2_KERNEL_PARAMS){};
+
+using MarlinInt2FuncPtr = void (*)(MARLIN_INT2_KERNEL_PARAMS);
+
+template <typename scalar_t>
+MarlinInt2FuncPtr get_marlin_int2_kernel(const vllm::ScalarType q_type,
+                                         int thread_m_blocks,
+                                         int thread_n_blocks,
+                                         int thread_k_blocks,
+                                         bool m_block_size_8, bool has_zp,
+                                         int group_blocks, int num_threads) {
+  int num_bits = q_type.size_bits();
+  auto kernel = MarlinInt2Default;
+  if (false) {
+  }
+
+  COMMON_GET_INT2_IF(vllm::kU4)
+
+  return kernel;
+}
+
+template <typename scalar_t>
+void marlin_int2_mm(const void* A, const void* B, void* C, void* C_tmp,
+                    void* zp, float* code_scale, float* code_zp,
+                    void* super_scale, void* sorted_token_ids, void* expert_ids,
+                    void* num_tokens_past_padded, void* topk_weights,
+                    int moe_block_size, int top_k, bool mul_topk_weights,
+                    bool is_ep, int prob_m, int prob_n, int prob_k,
+                    void* workspace, vllm::ScalarType const& q_type,
+                    bool has_zp, int num_groups, int group_size, int dev,
+                    cudaStream_t stream, int thread_k, int thread_n, int sms,
+                    bool use_atomic_add) {
+  int thread_m_blocks = div_ceil(moe_block_size, 16);
+  bool m_block_size_8 = moe_block_size == 8;
+
+  if (has_zp) {
+    TORCH_CHECK(
+        q_type == vllm::kU4 || q_type == vllm::kU8,
+        "q_type must be u4 or u8 when has_zp = True. Got = ", q_type.str());
+  } else {
+    TORCH_CHECK(
+        q_type == vllm::kU4B8 || q_type == vllm::kU8B128 ||
+            q_type == vllm::kFE4M3fn || q_type == vllm::kFE2M1f,
+        "q_type must be uint4b8, uint8b128, float8_e4m3fn or float4_e2m1f when "
+        "has_zp = False. Got = ",
+        q_type.str());
+  }
+
+  TORCH_CHECK(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [", prob_m,
+              ", ", prob_n, ", ", prob_k, "]");
+
+  int group_blocks = 0;
+  if (group_size == -1) {
+    group_blocks = -1;
+  } else {
+    group_blocks = group_size / 16;
+    TORCH_CHECK(prob_k % group_blocks == 0, "prob_k = ", prob_k,
+                " is not divisible by group_blocks = ", group_blocks);
+  }
+
+  int num_bits = q_type.size_bits();
+  const int4* A_ptr = (const int4*)A;
+  const int2* B_ptr = (const int2*)B;
+  int4* C_ptr = (int4*)C;
+  int4* C_tmp_ptr = (int4*)C_tmp;
+  const int4* zp_ptr = (const int4*)zp;
+  const float* code_scale_ptr = (const float*)code_scale;
+  const float* code_zp_ptr = (const float*)code_zp;
+  const void* super_scale_ptr = (const void*)super_scale;
+  const int32_t* sorted_token_ids_ptr = (const int32_t*)sorted_token_ids;
+  const int32_t* expert_ids_ptr = (const int32_t*)expert_ids;
+  const int32_t* num_tokens_past_padded_ptr =
+      (const int32_t*)num_tokens_past_padded;
+  const float* topk_weights_ptr = (const float*)topk_weights;
+  int* locks = (int*)workspace;
+
+  int max_shared_mem = 0;
+  cudaDeviceGetAttribute(&max_shared_mem,
+                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  TORCH_CHECK(max_shared_mem > 0);
+
+  // Set thread config
+  exec_config_t exec_cfg;
+  thread_config_t thread_tfg;
+  if (thread_k != -1 && thread_n != -1) {
+    thread_tfg = thread_config_t{thread_k, thread_n, default_threads};
+    exec_cfg = exec_config_t{1, thread_tfg};
+    TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
+                " is not divisible by thread_n = ", thread_n);
+    TORCH_CHECK(prob_k % thread_k == 0, "prob_k = ", prob_k,
+                " is not divisible by thread_k = ", thread_k);
+  } else {
+    // Auto config
+    exec_cfg = determine_exec_config<scalar_t>(
+        q_type, prob_m, prob_n, prob_k, thread_m_blocks, m_block_size_8,
+        num_bits, group_size, false /*has_act_order*/, true /*is_k_full*/,
+        has_zp, false /*is_zp_float*/, max_shared_mem);
+    thread_tfg = exec_cfg.tb_cfg;
+  }
+
+  int num_threads = thread_tfg.num_threads;
+  thread_k = thread_tfg.thread_k;
+  thread_n = thread_tfg.thread_n;
+  int blocks = sms * exec_cfg.blocks_per_sm;
+  if (exec_cfg.blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
+
+  TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
+                              prob_m, prob_n, prob_k, num_bits, group_size,
+                              false /*has_act_order*/, true /*is_k_full*/,
+                              has_zp, false /*is_zp_float*/, max_shared_mem),
+              "Invalid thread config: thread_m_blocks = ", thread_m_blocks,
+              ", thread_k = ", thread_tfg.thread_k,
+              ", thread_n = ", thread_tfg.thread_n,
+              ", num_threads = ", thread_tfg.num_threads, " for MKN = [",
+              prob_m, ", ", prob_k, ", ", prob_n, "] and num_bits = ", num_bits,
+              ", group_size = ", group_size, ", has_zp = ", has_zp,
+              ", max_shared_mem = ", max_shared_mem);
+
+  auto kernel = get_marlin_int2_kernel<scalar_t>(
+      q_type, thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8,
+      has_zp, group_blocks, num_threads);
+
+  if (kernel == MarlinInt2Default) {
+    TORCH_CHECK(
+        false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n, ", ",
+        prob_k, "]", ", num_groups = ", num_groups,
+        ", group_size = ", group_size, ", thread_m_blocks = ", thread_m_blocks,
+        ", thread_n_blocks = ", thread_n_blocks,
+        ", thread_k_blocks = ", thread_k_blocks, ", num_bits = ", num_bits);
+  }
+
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       max_shared_mem);
+  // avoid ">>>" being formatted to "> > >"
+  // clang-format off
+  kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, zp_ptr, code_scale_ptr,
+      code_zp_ptr, super_scale_ptr, sorted_token_ids_ptr, expert_ids_ptr,
+      num_tokens_past_padded_ptr, topk_weights_ptr, top_k, mul_topk_weights,
+      is_ep, num_groups, prob_m, prob_n, prob_k, locks, use_atomic_add,
+      max_shared_mem);
+  // clang-format on
+}
+}  // namespace MARLIN_NAMESPACE_NAME
+
 #endif
+torch::Tensor moe_wna16_marlin_int2_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> const& c_or_none,
+    torch::Tensor& b_q_weight,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    torch::Tensor& code_scales, torch::Tensor& code_zeros,
+    torch::Tensor& super_scales, torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids, torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded, torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights, bool is_ep,
+    vllm::ScalarTypeId const& b_q_type_id, int64_t size_m, int64_t size_n,
+    int64_t size_k, bool use_atomic_add) {
+  vllm::ScalarType const b_q_type = vllm::ScalarType::from_id(b_q_type_id);
+  // int pack_factor = 32 / b_q_type.size_bits();
+  const int pack_factor = 16 / 2;
+  // This is fixed in int2 kernel
+  const int group_size = 64;
+  const int num_groups = size_k / group_size;
+
+  TORCH_CHECK(code_scales.numel() == size_n * b_q_weight.size(0));
+  TORCH_CHECK(code_zeros.numel() == size_n * b_q_weight.size(0));
+  TORCH_CHECK(super_scales.numel() == size_n * b_q_weight.size(0));
+
+  TORCH_CHECK(code_scales.is_cuda());
+  TORCH_CHECK(code_zeros.is_cuda());
+  TORCH_CHECK(super_scales.is_cuda());
+
+  TORCH_CHECK(code_scales.is_contiguous());
+  TORCH_CHECK(code_zeros.is_contiguous());
+  TORCH_CHECK(super_scales.is_contiguous());
+
+  if (moe_block_size != 8) {
+    TORCH_CHECK(moe_block_size % 16 == 0,
+                "unsupported moe_block_size=", moe_block_size);
+    TORCH_CHECK(moe_block_size >= 16 && moe_block_size <= 64,
+                "unsupported moe_block_size=", moe_block_size);
+  }
+
+  // Verify A
+  TORCH_CHECK(a.size(0) == size_m, "Shape mismatch: a.size(0) = ", a.size(0),
+              ", size_m = ", size_m);
+  TORCH_CHECK(a.size(1) == size_k, "Shape mismatch: a.size(1) = ", a.size(1),
+              ", size_k = ", size_k);
+
+  // Verify B
+  TORCH_CHECK(
+      size_k % MARLIN_NAMESPACE_NAME::tile_size == 0, "size_k = ", size_k,
+      " is not divisible by tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
+  TORCH_CHECK((size_k / MARLIN_NAMESPACE_NAME::tile_size) == b_q_weight.size(1),
+              "Shape mismatch: b_q_weight.size(1) = ", b_q_weight.size(1),
+              ", size_k = ", size_k,
+              ", tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
+  TORCH_CHECK(
+      b_q_weight.size(2) % MARLIN_NAMESPACE_NAME::tile_size == 0,
+      "b_q_weight.size(2) = ", b_q_weight.size(2),
+      " is not divisible by tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
+  int actual_size_n =
+      (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
+  TORCH_CHECK(size_n == actual_size_n, "size_n = ", size_n,
+              ", actual_size_n = ", actual_size_n);
+
+  // Verify device and strides
+  TORCH_CHECK(a.device().is_cuda(), "A is not on GPU");
+  TORCH_CHECK(a.is_contiguous(), "A is not contiguous");
+
+  TORCH_CHECK(b_q_weight.device().is_cuda(), "b_q_weight is not on GPU");
+  TORCH_CHECK(b_q_weight.is_contiguous(), "b_q_weight is not contiguous");
+
+  // thread_k: `k` size of a thread_tile in `weights` (can usually be left as
+  // auto -1)
+  int thread_k = -1;
+  // thread_n: `n` size of a thread_tile in `weights` (can usually be left as
+  // auto -1)
+  int thread_n = -1;
+  // sms: number of SMs to use for the kernel
+  int sms = -1;
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, a.get_device());
+
+  // Alloc buffers
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
+  auto options = torch::TensorOptions().dtype(a.dtype()).device(a.device());
+  torch::Tensor c;
+  if (c_or_none.has_value()) {
+    c = c_or_none.value();
+    TORCH_CHECK(c.device().is_cuda(), "c is not on GPU");
+    TORCH_CHECK(c.is_contiguous(), "c is not contiguous");
+    TORCH_CHECK(c.size(0) == size_m * top_k,
+                "Shape mismatch: c.size(0) = ", c.size(0),
+                ", size_m * topk = ", size_m * top_k);
+    TORCH_CHECK(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1),
+                ", size_n = ", size_n);
+  } else {
+    c = torch::empty({size_m * top_k, size_n}, options);
+  }
+
+  // Alloc C tmp buffer that is going to be used for the global reduce
+  torch::Tensor c_tmp;
+  auto options_fp32 =
+      torch::TensorOptions().dtype(at::kFloat).device(a.device());
+  if (!use_atomic_add) {
+    // max num of threadblocks is sms * 4
+    long max_c_tmp_size = min(
+        (long)size_n * sorted_token_ids.size(0),
+        (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
+    if (moe_block_size == 8) max_c_tmp_size *= 2;
+    c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
+  } else {
+    c_tmp = torch::empty({0}, options_fp32);
+  }
+
+  torch::Tensor b_zeros;
+  if (b_zeros_or_none.has_value()) {
+    b_zeros = b_zeros_or_none.value();
+    TORCH_CHECK(b_zeros.device().is_cuda(), "b_zeros is not on GPU");
+    TORCH_CHECK(b_zeros.is_contiguous(), "b_zeros is not contiguous");
+  } else {
+    b_zeros = torch::empty({0}, options);
+  }
+  bool has_zp = b_zeros.size(-1) > 0;
+
+  if (has_zp) {
+    TORCH_CHECK(
+        b_q_type == vllm::kU4 || b_q_type == vllm::kU8,
+        "b_q_type must be u4 or u8 when has_zp = True. Got = ", b_q_type.str());
+  } else {
+    TORCH_CHECK(b_q_type == vllm::kU4B8 || b_q_type == vllm::kU8B128 ||
+                    b_q_type == vllm::kFE4M3fn || b_q_type == vllm::kFE2M1f,
+                "b_q_type must be uint4b8, uint8b128, float8_e4m3fn or "
+                "float4_e2m1f when "
+                "has_zp = False. Got = ",
+                b_q_type.str());
+  }
+
+  // Verify b_zeros
+  if (has_zp) {
+    int rank = b_zeros.sizes().size();
+    TORCH_CHECK(rank == 3, "b_zeros rank = ", rank, " is not 3");
+    TORCH_CHECK(b_zeros.size(1) == num_groups,
+                "b_zeros dim 1 = ", b_zeros.size(1),
+                " is not num_groups = ", num_groups);
+    TORCH_CHECK(b_zeros.size(2) == size_n / pack_factor,
+                "b_zeros dim 2 = ", b_zeros.size(2),
+                " is not size_n / pack_factor = ", size_n / pack_factor);
+  }
+
+  // Verify workspace size
+  TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
+              "size_n = ", size_n, ", is not divisible by min_thread_n = ",
+              MARLIN_NAMESPACE_NAME::min_thread_n);
+
+  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+  int min_workspace_size = min(
+      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+  TORCH_CHECK(workspace.numel() >= min_workspace_size,
+              "workspace.numel = ", workspace.numel(),
+              " is below min_workspace_size = ", min_workspace_size);
+
+  int dev = a.get_device();
+  if (a.scalar_type() == at::ScalarType::Half) {
+    MARLIN_NAMESPACE_NAME::marlin_int2_mm<half>(
+        a.data_ptr<at::Half>(), b_q_weight.data_ptr(), c.data_ptr<at::Half>(),
+        c_tmp.data_ptr<float>(), b_zeros.data_ptr(),
+        code_scales.data_ptr<float>(), code_zeros.data_ptr<float>(),
+        super_scales.data_ptr<at::Half>(), sorted_token_ids.data_ptr(),
+        expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
+        topk_weights.data_ptr(), moe_block_size, top_k, mul_topk_weights, is_ep,
+        size_m, size_n, size_k, workspace.data_ptr(), b_q_type, has_zp,
+        num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
+        thread_k, thread_n, sms, use_atomic_add);
+  } else if (a.scalar_type() == at::ScalarType::BFloat16) {
+    MARLIN_NAMESPACE_NAME::marlin_int2_mm<nv_bfloat16>(
+        a.data_ptr<at::BFloat16>(), b_q_weight.data_ptr(),
+        c.data_ptr<at::BFloat16>(), c_tmp.data_ptr<float>(), b_zeros.data_ptr(),
+        code_scales.data_ptr<float>(), code_zeros.data_ptr<float>(),
+        super_scales.data_ptr<at::BFloat16>(), sorted_token_ids.data_ptr(),
+        expert_ids.data_ptr(), num_tokens_past_padded.data_ptr(),
+        topk_weights.data_ptr(), moe_block_size, top_k, mul_topk_weights, is_ep,
+        size_m, size_n, size_k, workspace.data_ptr(), b_q_type, has_zp,
+        num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
+        thread_k, thread_n, sms, use_atomic_add);
+  } else {
+    TORCH_CHECK(false,
+                "moe_wna16_marlin_gemm only supports bfloat16 and float16");
+  }
+
+  return c;
+}
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
   m.impl("moe_wna16_marlin_gemm", &moe_wna16_marlin_gemm);
+}
+
+TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
+  m.impl("moe_wna16_marlin_int2_gemm", &moe_wna16_marlin_int2_gemm);
 }

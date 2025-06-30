@@ -93,6 +93,11 @@ class cmake_build_ext(build_ext):
     # A dict of extension directories that have been configured.
     did_config: dict[str, bool] = {}
 
+    def initialize_options(self):
+        super().initialize_options()
+        # Set a custom build temporary directory
+        self.build_temp = os.path.join(ROOT_DIR, "build")
+
     #
     # Determine number of compilation jobs and optionally nvcc compile threads.
     #
@@ -126,6 +131,9 @@ class cmake_build_ext(build_ext):
             else:
                 nvcc_threads = 1
             num_jobs = max(1, num_jobs // nvcc_threads)
+
+        num_jobs = 10
+        nvcc_threads = 1
 
         return num_jobs, nvcc_threads
 

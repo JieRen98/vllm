@@ -64,6 +64,27 @@ def marlin_weights(q_w, size_k, size_n, num_bits, perm):
     return q_packed
 
 
+def marlin_int2_weights(q_w, size_k, size_n, perm):
+    # Permute
+    q_w = marlin_permute_weights(q_w, size_k, size_n, perm)
+
+    num_bits = 2
+    # Pack
+    pack_factor = 16 // num_bits
+    orig_device = q_w.device
+
+    q_w = q_w.cpu().numpy().astype(np.uint16)
+
+    q_packed = np.zeros((q_w.shape[0], q_w.shape[1] // pack_factor),
+                        dtype=np.uint16)
+    for i in range(pack_factor):
+        q_packed |= q_w[:, i::pack_factor] << num_bits * i
+
+    q_packed = torch.from_numpy(q_packed.astype(np.int16)).to(orig_device)
+
+    return q_packed
+
+
 def get_weight_perm(num_bits: int):
     perm_list: list[int] = []
     for i in range(32):
@@ -88,6 +109,31 @@ def get_weight_perm(num_bits: int):
         interleave = np.array([0, 2, 1, 3])
     else:
         raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+
+    perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
+    perm = torch.from_numpy(perm)
+    return perm
+
+
+def get_int2_weight_perm():
+    perm_list: list[int] = []
+    for i in range(32):
+        perm1: list[int] = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm_list.extend([p + 256 * j for p in perm1])
+
+    perm = np.array(perm_list)
+
+    interleave = np.array([0, 1, 2, 3, 4, 5, 6, 7])
 
     perm = perm.reshape((-1, len(interleave)))[:, interleave].ravel()
     perm = torch.from_numpy(perm)
@@ -130,6 +176,33 @@ def marlin_quantize(w: torch.Tensor,
     return res_list
 
 
+def marlin_int2_quantize(w: torch.Tensor,
+                         quant_type: ScalarType,
+                         group_size: int):
+    size_k, size_n = w.shape
+
+    # Normalize group_size
+    if group_size == -1:
+        group_size = size_k
+    assert group_size <= size_k
+
+    # Quantize (and apply act_order if provided)
+    w_ref, q_w, s, _, _ = gptq_quantize_weights(
+        w, quant_type, group_size, False, None)
+
+    # Reformat to marlin
+    weight_perm = get_int2_weight_perm()
+    marlin_q_w = marlin_int2_weights(q_w, size_k, size_n, weight_perm)
+    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
+
+    # Create result
+    res_list = [w_ref, marlin_q_w, marlin_s]
+    for i in range(len(res_list)):
+        res_list[i] = res_list[i].to(w.device)
+
+    return res_list
+
+
 def awq_marlin_quantize(w: torch.Tensor, quant_type: ScalarType,
                         group_size: int):
     size_k, size_n = w.shape
@@ -153,6 +226,42 @@ def awq_marlin_quantize(w: torch.Tensor, quant_type: ScalarType,
     weight_perm = get_weight_perm(quant_type.size_bits)
     marlin_q_w = marlin_weights(q_w, size_k, size_n, quant_type.size_bits,
                                 weight_perm)
+    marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
+    marlin_zp = marlin_zero_points(zp, num_groups, size_n,
+                                   quant_type.size_bits)
+
+    # Create result
+    res_list = [w_ref, marlin_q_w, marlin_s, marlin_zp]
+    for i in range(len(res_list)):
+        res_list[i] = res_list[i].to(w.device)
+
+    return res_list
+
+
+def awq_marlin_int2_quantize(w: torch.Tensor, quant_type: ScalarType,
+                             group_size: int):
+    size_k, size_n = w.shape
+
+    # Normalize group_size
+    if group_size == -1:
+        group_size = size_k
+    assert group_size <= size_k
+
+    # Detect num groups
+    assert size_k % group_size == 0
+    num_groups = size_k // group_size
+
+    # Quantize with zp
+    w_ref, q_w, s, zp = quantize_weights(w,
+                                         quant_type,
+                                         group_size,
+                                         zero_points=True)
+
+    assert quant_type.size_bits == 4
+
+    # Reformat to marlin
+    weight_perm = get_int2_weight_perm()
+    marlin_q_w = marlin_int2_weights(q_w, size_k, size_n, weight_perm)
     marlin_s = marlin_permute_scales(s, size_k, size_n, group_size)
     marlin_zp = marlin_zero_points(zp, num_groups, size_n,
                                    quant_type.size_bits)

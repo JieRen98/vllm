@@ -29,7 +29,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     marlin_quant_fp8_torch)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-    awq_marlin_quantize, marlin_quantize)
+    awq_marlin_quantize, awq_marlin_int2_quantize, marlin_quantize, marlin_int2_quantize)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     quantize_weights)
 from vllm.model_executor.models.mixtral import MixtralMoE
@@ -695,6 +695,180 @@ def test_fused_marlin_moe(
         quant_type_id=quant_type.id,
         is_k_full=is_k_full)
 
+    torch.testing.assert_close(marlin_output, torch_output, atol=5e-2, rtol=0)
+
+
+def marlin_int2_moe_generate_valid_test_cases():
+    import itertools
+    m_list = [1, 123, 666]
+    n_list = [128, 1024]
+    k_list = [256, 2048]
+    e_list = [4, 12]
+    topk_list = [2, 3]
+    ep_size_list = [1, 4]
+    dtype_list = [torch.half, torch.bfloat16]
+    # group_size_list = [-1, 16, 32, 128]
+    group_size_list = [64]
+    quant_type_list = [
+        scalar_types.uint4,
+    ]
+
+    all_combinations = itertools.product(m_list, n_list, k_list, e_list,
+                                         topk_list, ep_size_list, dtype_list,
+                                         group_size_list, quant_type_list)
+
+    def is_invalid(m, n, k, e, topk, ep_size, dtype, group_size, quant_type):
+
+        if quant_type == scalar_types.float8_e4m3fn and \
+                group_size not in [-1, 128]:
+            return False
+        if quant_type == scalar_types.float4_e2m1f and group_size != 16:
+            return False
+        if quant_type != scalar_types.float4_e2m1f and group_size == 16:
+            return False
+
+        return True
+
+    cases = []
+    for case in all_combinations:
+        if is_invalid(*case):
+            cases.append(case)
+    return cases
+
+
+@pytest.mark.flaky(reruns=2)
+@pytest.mark.parametrize(("m, n, k, e, topk, ep_size, dtype, group_size,"
+                          "quant_type"),
+                         marlin_int2_moe_generate_valid_test_cases())
+@pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
+def test_fused_marlin_int2_moe(
+        m: int,
+        n: int,
+        k: int,
+        e: int,
+        topk: int,
+        ep_size: int,
+        dtype: torch.dtype,
+        group_size: int,
+        quant_type: ScalarType,
+):
+    torch.cuda.manual_seed(0)
+    has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
+
+    if quant_type == scalar_types.float8_e4m3fn:
+        if group_size not in [-1, 128]:
+            return
+
+    if quant_type == scalar_types.float4_e2m1f and group_size != 16:
+        return
+    if quant_type != scalar_types.float4_e2m1f and group_size == 16:
+        return
+
+    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+    # w1 = torch.randint(-1, 2, (e, 2 * n, k), device="cuda", dtype=dtype)
+    # w2 = torch.randint(-1, 2, (e, k, n), device="cuda", dtype=dtype)
+    # w1 = torch.zeros_like(w1)
+    # w2 = torch.zeros_like(w2)
+
+    if ep_size > 1:
+        local_e = e // ep_size
+        e_ids = torch.randperm(e, device="cuda", dtype=torch.int32)[:local_e]
+        e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
+        e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
+        w1 = w1[e_ids]
+        w2 = w2[e_ids]
+    else:
+        e_map = None
+
+    w_ref1_l = []
+    qweight1_l = []
+    zeros1_l = []
+
+    for i in range(w1.shape[0]):
+        if has_zp:
+            w_ref1, qweight1, scales1, zeros1 = awq_marlin_int2_quantize(
+                w1[i].transpose(1, 0), quant_type, group_size)
+
+            w_ref1_l.append(w_ref1.T)
+            qweight1_l.append(qweight1)
+            zeros1_l.append(zeros1)
+        else:
+            w_ref1, qweight1, scales1,  = \
+                marlin_int2_quantize(w1[i].transpose(1, 0), quant_type,
+                                     group_size)
+
+            w_ref1_l.append(w_ref1.T)
+            qweight1_l.append(qweight1)
+
+    w_ref1 = stack_and_dev(w_ref1_l)
+    qweight1 = stack_and_dev(qweight1_l).contiguous()
+    zeros1 = stack_and_dev(zeros1_l) if zeros1_l else None
+
+    w_ref2_l = []
+    qweight2_l = []
+    zeros2_l = []
+
+    for i in range(w2.shape[0]):
+        if has_zp:
+            w_ref2, qweight2, scales2, zeros2 = awq_marlin_int2_quantize(
+                w2[i].transpose(1, 0), quant_type, group_size)
+
+            w_ref2_l.append(w_ref2.T)
+            qweight2_l.append(qweight2)
+            zeros2_l.append(zeros2)
+        else:
+            w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = \
+                marlin_int2_quantize(w2[i].transpose(1, 0), quant_type,
+                                     group_size)
+
+            w_ref2_l.append(w_ref2.T)
+            qweight2_l.append(qweight2)
+
+    w_ref2 = stack_and_dev(w_ref2_l)
+    qweight2 = stack_and_dev(qweight2_l).contiguous()
+    zeros2 = stack_and_dev(zeros2_l) if zeros2_l else None
+
+    score = torch.randn((m, e), device="cuda", dtype=dtype)
+
+    topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
+
+    with set_current_vllm_config(vllm_config):
+        torch_output = torch_moe(a,
+                                 w_ref1,
+                                 w_ref2,
+                                 score,
+                                 topk,
+                                 expert_map=e_map)
+
+    w1_scales = torch.zeros(2 * n, dtype=torch.float32, device=qweight1.device)
+    w2_scales = torch.zeros(k, dtype=torch.float32, device=qweight1.device)
+    w1_zeros = torch.zeros(2 * n, dtype=torch.float32, device=qweight1.device)
+    w2_zeros = torch.zeros(k, dtype=torch.float32, device=qweight1.device)
+    w1_super_scales = torch.zeros(2 * n, dtype=a.dtype, device=qweight1.device)
+    w2_super_scales = torch.zeros(k, dtype=a.dtype, device=qweight1.device)
+    marlin_output = torch.ops.vllm.fused_marlin_int2_moe(
+        a,
+        qweight1,
+        qweight2,
+        w1_scales,
+        w2_scales,
+        w1_zeros,
+        w2_zeros,
+        w1_super_scales,
+        w2_super_scales,
+        score,
+        topk_weights,
+        topk_ids,
+        global_num_experts=e,
+        expert_map=e_map,
+        w1_zeros=zeros1,
+        w2_zeros=zeros2,
+        quant_type_id=quant_type.id)
+
+    if not torch.allclose(marlin_output, torch_output, atol=5e-2, rtol=0):
+        pass
     torch.testing.assert_close(marlin_output, torch_output, atol=5e-2, rtol=0)
 
 

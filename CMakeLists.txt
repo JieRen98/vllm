@@ -77,6 +77,7 @@ endif()
 # so there is no need to do this explicitly with check_language/enable_language,
 # etc.
 #
+find_package(CUDA REQUIRED)
 find_package(Torch REQUIRED)
 
 # Supported NVIDIA architectures.
@@ -87,6 +88,8 @@ if(DEFINED CMAKE_CUDA_COMPILER_VERSION AND
 else()
   set(CUDA_SUPPORTED_ARCHS "7.0;7.2;7.5;8.0;8.6;8.7;8.9;9.0")
 endif()
+
+set(CUDA_SUPPORTED_ARCHS "8.6")
 
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
