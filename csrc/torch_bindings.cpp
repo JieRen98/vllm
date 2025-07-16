@@ -514,6 +514,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                   Tensor page_table, float scale) -> ()");
   ops.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
 
+#if ENABLE_CUTLASS_MOE_SM100
   // SM100 CUTLASS MLA decode
   ops.def(
       "sm100_cutlass_mla_decode(Tensor! out, Tensor q_nope, Tensor q_pe,"
@@ -530,6 +531,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> int");
   ops.impl("sm100_cutlass_mla_get_workspace_size",
            &sm100_cutlass_mla_get_workspace_size);
+#endif
 
   // Compute NVFP4 block quantized tensor.
   ops.def(
