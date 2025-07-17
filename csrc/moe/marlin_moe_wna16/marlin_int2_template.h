@@ -967,34 +967,30 @@ __global__ void MarlinInt2(
         const auto b0_quant = static_cast<float>((b_quant) & 0xFF);
         const auto b0_recovered_pack = static_cast<int16_t>(
             b0_quant * frag_code_scale[0 + j * 2] + frag_code_zp[0 + j * 2]);
-        float b0_recovered[4];
-        b0_recovered[0] = (b0_recovered_pack >> 9) & 0x3F - bzp;
-        b0_recovered[1] = (b0_recovered_pack >> 6) & 0x3F - bzp;
-        b0_recovered[2] = (b0_recovered_pack >> 3) & 0x3F - bzp;
-        b0_recovered[3] = (b0_recovered_pack >> 0) & 0x3F - bzp;
+        scalar_t2 b0_recovered[2];
+        b0_recovered[0].x = (b0_recovered_pack >> 9) & 0x3F - bzp;
+        b0_recovered[0].y = (b0_recovered_pack >> 6) & 0x3F - bzp;
+        b0_recovered[1].x = (b0_recovered_pack >> 3) & 0x3F - bzp;
+        b0_recovered[1].y = (b0_recovered_pack >> 0) & 0x3F - bzp;
 
-        float b0_scale = frag_zp[j].x * super_scale[0 + j * 2];
+        scalar_t2 b0_scale = Dtype::num2num2(frag_zp[j].x * super_scale[0 + j * 2]);
 
-        frag_b0[0].x = b0_recovered[0] * b0_scale;
-        frag_b0[0].y = b0_recovered[1] * b0_scale;
-        frag_b0[1].x = b0_recovered[2] * b0_scale;
-        frag_b0[1].y = b0_recovered[3] * b0_scale;
+        frag_b0[0] = b0_recovered[0] * b0_scale;
+        frag_b0[1] = b0_recovered[1] * b0_scale;
 
         const auto b1_quant = static_cast<float>((b_quant >> 8) & 0xFF);
         const auto b1_recovered_pack = static_cast<int16_t>(
             b1_quant * frag_code_scale[1 + j * 2] + frag_code_zp[1 + j * 2]);
-        float b1_recovered[4];
-        b1_recovered[0] = (b1_recovered_pack >> 9) & 0x3F - bzp;
-        b1_recovered[1] = (b1_recovered_pack >> 6) & 0x3F - bzp;
-        b1_recovered[2] = (b1_recovered_pack >> 3) & 0x3F - bzp;
-        b1_recovered[3] = (b1_recovered_pack >> 0) & 0x3F - bzp;
+        scalar_t2 b1_recovered[2];
+        b1_recovered[0].x = (b1_recovered_pack >> 9) & 0x3F - bzp;
+        b1_recovered[0].y = (b1_recovered_pack >> 6) & 0x3F - bzp;
+        b1_recovered[1].x = (b1_recovered_pack >> 3) & 0x3F - bzp;
+        b1_recovered[1].y = (b1_recovered_pack >> 0) & 0x3F - bzp;
 
-        float b1_scale = frag_zp[j].y * super_scale[1 + j * 2];
+        scalar_t2 b1_scale = Dtype::num2num2(frag_zp[j].y * super_scale[1 + j * 2]);
 
-        frag_b1[0].x = b1_recovered[0] * b1_scale;
-        frag_b1[0].y = b1_recovered[1] * b1_scale;
-        frag_b1[1].x = b1_recovered[2] * b1_scale;
-        frag_b1[1].y = b1_recovered[3] * b1_scale;
+        frag_b1[0] = b1_recovered[0] * b1_scale;
+        frag_b1[1] = b1_recovered[1] * b1_scale;
       }
 
   #pragma unroll
