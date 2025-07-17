@@ -43,24 +43,56 @@ if __name__ == "__main__":
     score = torch.randn((m, e), dtype=dtype, device=device)
     topk_weights, topk_ids, _ = fused_topk(a, score, topk, False)
 
+    stream = torch.cuda.Stream()
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    with stream:
+        for _ in range(5):
+            marlin_output = torch.ops.vllm.fused_marlin_int2_moe(
+                a,
+                qweight1,
+                qweight2,
+                code_scales1,
+                code_scales2,
+                code_zeros1,
+                code_zeros2,
+                super_scales1,
+                super_scales2,
+                score,
+                topk_weights,
+                topk_ids,
+                global_num_experts=e,
+                expert_map=None,
+                w1_zeros=zeros1,
+                w2_zeros=zeros2,
+                quant_type_id=quant_type.id)
+
+    torch.cuda.synchronize()
+    start_event.record(stream)
     torch.cuda.nvtx.range_push("marlin")
-    marlin_output = torch.ops.vllm.fused_marlin_int2_moe(
-        a,
-        qweight1,
-        qweight2,
-        code_scales1,
-        code_scales2,
-        code_zeros1,
-        code_zeros2,
-        super_scales1,
-        super_scales2,
-        score,
-        topk_weights,
-        topk_ids,
-        global_num_experts=e,
-        expert_map=None,
-        w1_zeros=zeros1,
-        w2_zeros=zeros2,
-        quant_type_id=quant_type.id)
+    with stream:
+        for _ in range(5):
+            marlin_output = torch.ops.vllm.fused_marlin_int2_moe(
+                a,
+                qweight1,
+                qweight2,
+                code_scales1,
+                code_scales2,
+                code_zeros1,
+                code_zeros2,
+                super_scales1,
+                super_scales2,
+                score,
+                topk_weights,
+                topk_ids,
+                global_num_experts=e,
+                expert_map=None,
+                w1_zeros=zeros1,
+                w2_zeros=zeros2,
+                quant_type_id=quant_type.id)
+    end_event.record(stream)
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
+    elapsed_time = start_event.elapsed_time(end_event)
+    print(f"Time taken: {elapsed_time} ms")
