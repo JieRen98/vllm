@@ -273,6 +273,77 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
   return cache_size <= max_shared_mem;
 }
 
+int get_int2_kernel_cache_size(thread_config_t const& th_config,
+                               bool m_block_size_8, int thread_m_blocks,
+                               int prob_m, int prob_n, int prob_k, int num_bits,
+                               int group_size, bool has_act_order,
+                               bool is_k_full, int has_zp, int is_zp_float) {
+  int pack_factor = 32 / num_bits;
+
+  // Get B size
+  int tb_k = th_config.thread_k;
+  int tb_n = th_config.thread_n;
+  int tb_m = thread_m_blocks * (m_block_size_8 ? 8 : 16);
+
+  // shm size for block_sorted_ids/rd_block_sorted_ids/block_topk_weights
+  // both of them requires tb_m * 4 bytes (tb_m * int32 or tb_m * float32)
+  int sh_block_meta_size = tb_m * 4;
+  int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
+  int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 2;
+  int sh_red_size = tb_m * (tb_n + 8) * 2;
+  int sh_s_size =
+      get_scales_cache_size(th_config, prob_m, prob_n, prob_k, num_bits,
+                            group_size, has_act_order, is_k_full);
+  int sh_g_idx_size = has_act_order && !is_k_full ? pipe_stages * tb_k / 4 : 0;
+  int sh_zp_size = 0;
+  if (has_zp) {
+    if (is_zp_float)
+      sh_zp_size = sh_s_size;
+    else if (num_bits == 4)
+      sh_zp_size = sh_s_size / 4;
+    else if (num_bits == 8)
+      sh_zp_size = sh_s_size / 2;
+  }
+
+  int total_size = max(sh_b_size, sh_red_size) + sh_a_size + sh_s_size +
+                   sh_zp_size + sh_g_idx_size + sh_block_meta_size;
+
+  return total_size;
+}
+
+bool is_valid_int2_config(thread_config_t const& th_config, bool m_block_size_8,
+                          int thread_m_blocks, int prob_m, int prob_n,
+                          int prob_k, int num_bits, int group_size,
+                          bool has_act_order, bool is_k_full, int has_zp,
+                          int is_zp_float, int max_shared_mem) {
+  // Sanity
+  if (th_config.thread_k == -1 || th_config.thread_n == -1 ||
+      th_config.num_threads == -1) {
+    return false;
+  }
+
+  // Verify K/N are divisible by thread K/N
+  if (prob_k % th_config.thread_k != 0 || prob_n % th_config.thread_n != 0) {
+    return false;
+  }
+
+  // Verify min for thread K/N
+  if (th_config.thread_n < min_thread_n || th_config.thread_k < min_thread_k) {
+    return false;
+  }
+
+  // num_threads must be at least 128 (= 4 warps)
+  if (th_config.num_threads < 128) {
+    return false;
+  }
+
+  // Check that pipeline fits into cache
+  int cache_size = get_kernel_cache_size(
+      th_config, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+      num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
+  return cache_size <= max_shared_mem;
+}
+
   #define _GET_IF(W_TYPE, THREAD_M_BLOCKS, THREAD_N_BLOCKS, THREAD_K_BLOCKS, \
                   M_BLOCK_SIZE_8, GROUP_BLOCKS, NUM_THREADS, IS_ZP_FLOAT)    \
     else if (q_type == W_TYPE && thread_m_blocks == THREAD_M_BLOCKS &&       \
@@ -993,6 +1064,71 @@ MarlinInt2FuncPtr get_marlin_int2_kernel(const vllm::ScalarType q_type,
 }
 
 template <typename scalar_t>
+exec_config_t determine_int2_exec_config(const vllm::ScalarType& q_type,
+                                         int prob_m, int prob_n, int prob_k,
+                                         int thread_m_blocks,
+                                         bool m_block_size_8, int num_bits,
+                                         int group_size, bool has_act_order,
+                                         bool is_k_full, bool has_zp,
+                                         bool is_zp_float, int max_shared_mem) {
+  exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
+  thread_config_t* thread_configs = thread_m_blocks > 1
+                                        ? large_batch_thread_configs
+                                        : small_batch_thread_configs;
+  int thread_configs_size =
+      thread_m_blocks > 1
+          ? sizeof(large_batch_thread_configs) / sizeof(thread_config_t)
+          : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
+
+  int count = 0;
+  constexpr int device_max_reg_size = 255 * 1024;
+  for (int i = 0; i < thread_configs_size; i++) {
+    thread_config_t th_config = thread_configs[i];
+
+    if (!is_valid_int2_config(th_config, m_block_size_8, thread_m_blocks,
+                              prob_m, prob_n, prob_k, num_bits, group_size,
+                              has_act_order, is_k_full, has_zp, is_zp_float,
+                              max_shared_mem)) {
+      continue;
+    }
+
+    int cache_size = get_int2_kernel_cache_size(
+        th_config, m_block_size_8, thread_m_blocks, prob_m, prob_n, prob_k,
+        num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float);
+
+    int group_blocks = 0;
+    if (!has_act_order) {
+      group_blocks = group_size == -1 ? -1 : (group_size / 16);
+    }
+
+    auto kernel = get_marlin_int2_kernel<scalar_t>(
+        q_type, thread_m_blocks, th_config.thread_n / 16,
+        th_config.thread_k / 16, m_block_size_8, has_zp, group_blocks,
+        th_config.num_threads);
+
+    if (kernel == MarlinInt2Default) continue;
+
+    if (thread_m_blocks > 1) {
+      exec_cfg = {1, th_config};
+      break;
+    } else {
+      cudaFuncAttributes attr;
+      cudaFuncGetAttributes(&attr, kernel);
+      int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
+      int allow_count = min(device_max_reg_size / reg_size,
+                            max_shared_mem / (cache_size + 1024));
+      allow_count = max(min(allow_count, 4), 1);
+      if (allow_count > count) {
+        count = allow_count;
+        exec_cfg = {count, th_config};
+      };
+    }
+  }
+
+  return exec_cfg;
+}
+
+template <typename scalar_t>
 void marlin_int2_mm(const void* A, const void* B, void* C, void* C_tmp,
                     void* zp, float* code_scale, float* code_zp,
                     void* super_scale, void* sorted_token_ids, void* expert_ids,
@@ -1052,6 +1188,19 @@ void marlin_int2_mm(const void* A, const void* B, void* C, void* C_tmp,
                          cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
   TORCH_CHECK(max_shared_mem > 0);
 
+  static bool is_h800 = [] {
+    cudaDeviceProp prop;
+    int device;
+    cudaGetDevice(&device);
+    cudaGetDeviceProperties(&prop, device);
+
+    return std::string(prop.name) == "NVIDIA H800";
+  }();
+
+  if (is_h800) {
+    max_shared_mem = 226176;
+  }
+
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
@@ -1064,7 +1213,7 @@ void marlin_int2_mm(const void* A, const void* B, void* C, void* C_tmp,
                 " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    exec_cfg = determine_exec_config<scalar_t>(
+    exec_cfg = determine_int2_exec_config<scalar_t>(
         q_type, prob_m, prob_n, prob_k, thread_m_blocks, m_block_size_8,
         num_bits, group_size, false /*has_act_order*/, true /*is_k_full*/,
         has_zp, false /*is_zp_float*/, max_shared_mem);
@@ -1081,17 +1230,18 @@ void marlin_int2_mm(const void* A, const void* B, void* C, void* C_tmp,
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
 
-  TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
-                              prob_m, prob_n, prob_k, num_bits, group_size,
-                              false /*has_act_order*/, true /*is_k_full*/,
-                              has_zp, false /*is_zp_float*/, max_shared_mem),
-              "Invalid thread config: thread_m_blocks = ", thread_m_blocks,
-              ", thread_k = ", thread_tfg.thread_k,
-              ", thread_n = ", thread_tfg.thread_n,
-              ", num_threads = ", thread_tfg.num_threads, " for MKN = [",
-              prob_m, ", ", prob_k, ", ", prob_n, "] and num_bits = ", num_bits,
-              ", group_size = ", group_size, ", has_zp = ", has_zp,
-              ", max_shared_mem = ", max_shared_mem);
+  TORCH_CHECK(
+      is_valid_int2_config(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
+                           prob_n, prob_k, num_bits, group_size,
+                           false /*has_act_order*/, true /*is_k_full*/, has_zp,
+                           false /*is_zp_float*/, max_shared_mem),
+      "Invalid thread config: thread_m_blocks = ", thread_m_blocks,
+      ", thread_k = ", thread_tfg.thread_k,
+      ", thread_n = ", thread_tfg.thread_n,
+      ", num_threads = ", thread_tfg.num_threads, " for MKN = [", prob_m, ", ",
+      prob_k, ", ", prob_n, "] and num_bits = ", num_bits,
+      ", group_size = ", group_size, ", has_zp = ", has_zp,
+      ", max_shared_mem = ", max_shared_mem);
 
   auto kernel = get_marlin_int2_kernel<scalar_t>(
       q_type, thread_m_blocks, thread_n_blocks, thread_k_blocks, m_block_size_8,

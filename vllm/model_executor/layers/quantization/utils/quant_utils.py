@@ -527,7 +527,7 @@ def pack_cols(
     for i in range(pack_factor):
         q_res |= q_w[:, i::pack_factor] << num_bits * i
 
-    q_res = torch.from_numpy(q_res.astype(numpy.int32)).to(orig_device)
+    q_res = torch.from_numpy(q_res).to(orig_device)
     q_res = q_res.contiguous()
 
     return q_res
