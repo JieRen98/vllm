@@ -288,6 +288,43 @@ __device__ inline void cp_async2(void* smem_ptr, const void* glob_ptr) {
       "l"(glob_ptr), "n"(BYTES));
 }
 
+template <typename T>
+struct FastDequantOp;
+
+template <>
+struct FastDequantOp<nv_half> {
+  __device__ static auto call(const int q) {
+    constexpr int LO = 0x003f003f;
+    constexpr int EX = 0x64006400;
+    // Guarantee that the `(a & b) | c` operations are LOP3s.
+    // clang-format off
+    int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+    // clang-format on
+    // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point
+    // directly into `SUB` and `ADD`.
+    constexpr int SUB = 0x64206420;
+    return __hsub2(*reinterpret_cast<nv_half2*>(&lo),
+                   *reinterpret_cast<const nv_half2*>(&SUB));
+  }
+};
+
+template <>
+struct FastDequantOp<nv_bfloat16> {
+  __device__ static auto call(const int q) {
+    constexpr int LO = 0x003f003f;
+    constexpr int EX = 0x43004300;
+    // Guarantee that the `(a & b) | c` operations are LOP3s.
+    // clang-format off
+    int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+    // clang-format on
+    // We want signed int4 outputs, hence we fuse the `-8` symmetric zero point
+    // directly into `SUB` and `ADD`.
+    constexpr int SUB = 0x43204320;
+    return __hsub2(*reinterpret_cast<nv_bfloat162*>(&lo),
+                   *reinterpret_cast<const nv_bfloat162*>(&SUB));
+  }
+};
+
 template <typename scalar_t,  // compute dtype, half or nv_float16
           const vllm::ScalarTypeId w_type_id,  // weight ScalarType id
           const int threads,          // number of threads in a threadblock
@@ -304,6 +341,7 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
+__launch_bounds__((threads))
 __global__ void MarlinInt2(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
     const int2* __restrict__ B,  // 2bit quantized weight matrix of shape kxn
@@ -961,6 +999,15 @@ __global__ void MarlinInt2(
 
       int16_t b_quant = frag_b_quant[k2][0][j];
 
+      using FastDequantOp = FastDequantOp<scalar_t>;
+
+      union {
+        int16_t i16[2];
+        int32_t i32;
+      } b_recovered_pack_i32;
+
+      // constexpr int bzp = 32;
+
       {
         constexpr int bzp = 32;
 
@@ -968,26 +1015,47 @@ __global__ void MarlinInt2(
         const auto b0_recovered_pack = static_cast<int16_t>(
             b0_quant * frag_code_scale[0 + j * 2] + frag_code_zp[0 + j * 2]);
         scalar_t2 b0_recovered[2];
-        b0_recovered[0].x = (b0_recovered_pack >> 9) & 0x3F - bzp;
-        b0_recovered[0].y = (b0_recovered_pack >> 6) & 0x3F - bzp;
-        b0_recovered[1].x = (b0_recovered_pack >> 3) & 0x3F - bzp;
-        b0_recovered[1].y = (b0_recovered_pack >> 0) & 0x3F - bzp;
 
-        scalar_t2 b0_scale = Dtype::num2num2(frag_zp[j].x * super_scale[0 + j * 2]);
+        b_recovered_pack_i32.i16[0] = b0_recovered_pack >> 9;
+        b_recovered_pack_i32.i16[1] = b0_recovered_pack >> 6;
+        b0_recovered[0] = FastDequantOp::call(b_recovered_pack_i32.i32);
+
+        b_recovered_pack_i32.i16[0] = b0_recovered_pack >> 3;
+        b_recovered_pack_i32.i16[1] = b0_recovered_pack >> 0;
+        b0_recovered[1] = FastDequantOp::call(b_recovered_pack_i32.i32);
+
+        // b0_recovered[0].x = (b0_recovered_pack >> 9) & 0x3F - bzp;
+        // b0_recovered[0].y = (b0_recovered_pack >> 6) & 0x3F - bzp;
+        // b0_recovered[1].x = (b0_recovered_pack >> 3) & 0x3F - bzp;
+        // b0_recovered[1].y = (b0_recovered_pack >> 0) & 0x3F - bzp;
+
+        scalar_t2 b0_scale =
+            Dtype::num2num2(frag_zp[j].x * super_scale[0 + j * 2]);
 
         frag_b0[0] = b0_recovered[0] * b0_scale;
         frag_b0[1] = b0_recovered[1] * b0_scale;
-
+      }
+      {
         const auto b1_quant = static_cast<float>((b_quant >> 8) & 0xFF);
         const auto b1_recovered_pack = static_cast<int16_t>(
             b1_quant * frag_code_scale[1 + j * 2] + frag_code_zp[1 + j * 2]);
         scalar_t2 b1_recovered[2];
-        b1_recovered[0].x = (b1_recovered_pack >> 9) & 0x3F - bzp;
-        b1_recovered[0].y = (b1_recovered_pack >> 6) & 0x3F - bzp;
-        b1_recovered[1].x = (b1_recovered_pack >> 3) & 0x3F - bzp;
-        b1_recovered[1].y = (b1_recovered_pack >> 0) & 0x3F - bzp;
 
-        scalar_t2 b1_scale = Dtype::num2num2(frag_zp[j].y * super_scale[1 + j * 2]);
+        b_recovered_pack_i32.i16[0] = b1_recovered_pack >> 9;
+        b_recovered_pack_i32.i16[1] = b1_recovered_pack >> 6;
+        b1_recovered[0] = FastDequantOp::call(b_recovered_pack_i32.i32);
+
+        b_recovered_pack_i32.i16[0] = b1_recovered_pack >> 3;
+        b_recovered_pack_i32.i16[1] = b1_recovered_pack >> 0;
+        b1_recovered[1] = FastDequantOp::call(b_recovered_pack_i32.i32);
+
+        // b1_recovered[0].x = (b1_recovered_pack >> 9) & 0x3F - bzp;
+        // b1_recovered[0].y = (b1_recovered_pack >> 6) & 0x3F - bzp;
+        // b1_recovered[1].x = (b1_recovered_pack >> 3) & 0x3F - bzp;
+        // b1_recovered[1].y = (b1_recovered_pack >> 0) & 0x3F - bzp;
+
+        scalar_t2 b1_scale =
+            Dtype::num2num2(frag_zp[j].y * super_scale[1 + j * 2]);
 
         frag_b1[0] = b1_recovered[0] * b1_scale;
         frag_b1[1] = b1_recovered[1] * b1_scale;
